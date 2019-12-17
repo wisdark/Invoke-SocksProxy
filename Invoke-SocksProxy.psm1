@@ -8,7 +8,7 @@ License: MIT
  
 .DESCRIPTION
  
-Creates a Socks proxy using powershell.
+Creates a local or "reverse" Socks proxy using powershell.
  
 Supports both Socks4 and Socks5 connections.
 
@@ -16,13 +16,36 @@ This is only a subset of the Socks 4 and 5 protocols: It does not support authen
  
 New features will be implemented in the future. PRs are welcome.
  
- .EXAMPLE
+ .EXAMPLE_LOCAL
  
-Create a Socks proxy on port 1234:
+# Create a Socks proxy on port 1234:
 Invoke-SocksProxy -bindPort 1234
 
-Change the number of threads from 200 to 400:
+# Change the number of threads from 200 to 400:
 Invoke-SocksProxy -bindPort 1234 -threads 400
+
+ .EXAMPLE_REVERSE
+ 
+# On the remote host: 
+# Generate a private key and self signed cert
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout private.key -out cert.pem
+
+# Get the certificate fingerprint to verify it:
+openssl x509 -in cert.pem -noout -sha1 -fingerprint | cut -d "=" -f 2 | tr -d ":"
+
+# Start the handler
+python ReverseSocksProxyHandler.py 443 1080 ./cert.pem ./private.key
+
+# On the local host:
+Import-Module .\Invoke-SocksProxy.psm1
+Invoke-ReverseSocksProxy -remotePort 443 -remoteHost 192.168.49.130 
+
+# Go through the system proxy:
+Invoke-ReverseSocksProxy -remotePort 443 -remoteHost 192.168.49.130 -useSystemProxy
+
+# Validate certificate
+Invoke-ReverseSocksProxy -remotePort 443 -remoteHost 192.168.49.130 -useSystemProxy -certFingerprint '93061FDB30D69A435ACF96430744C5CC5473D44E'
+
 #>
  
  
@@ -47,7 +70,7 @@ Invoke-SocksProxy -bindPort 1234 -threads 400
     $buffer = New-Object System.Byte[] 32
     try
     {
-        $cliStream = $client.GetStream()
+        $cliStream = $vars.cliStream
         $cliStream.Read($buffer,0,2) | Out-Null
         $socksVer=$buffer[0]
         if ($socksVer -eq 5){
@@ -184,8 +207,9 @@ function Invoke-SocksProxy{
         write-host "Listening on port $bindPort..."
         while($true){
             $client = $listener.AcceptTcpClient()
+            $cliStream = $client.GetStream()
             Write-Host "New Connection from " $client.Client.RemoteEndPoint
-            $vars = [PSCustomObject]@{"cliConnection"=$client; "rsp"=$rsp}
+            $vars = [PSCustomObject]@{"cliConnection"=$client; "rsp"=$rsp; "cliStream" = $cliStream}
             $PS3 = [PowerShell]::Create()
             $PS3.RunspacePool = $rsp;
             $PS3.AddScript($SocksConnectionMgr).AddArgument($vars) | Out-Null
@@ -212,7 +236,130 @@ function Invoke-SocksProxy{
         }
     }
 }
+
+# Credit to Arno0x for this technique
+function getProxyConnection{
+
+    param (
  
+            [String]$remoteHost,
+ 
+            [Int]$remotePort
+
+     )
+    #Sleep -Milliseconds 500
+    $request = [System.Net.HttpWebRequest]::Create("http://" + $remoteHost + ":" + $remotePort ) 
+    $request.Method = "CONNECT";
+    $proxy = [System.Net.WebRequest]::GetSystemWebProxy();
+    $proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials;
+    $request.Proxy = $proxy;
+    $request.timeout = 1000;
+    $serverResponse = $request.GetResponse();
+    $request.timeout = 100000;
+    $responseStream = $serverResponse.GetResponseStream()
+    $BindingFlags= [Reflection.BindingFlags] "NonPublic,Instance"
+    $rsType = $responseStream.GetType()
+    $connectionProperty = $rsType.GetProperty("Connection", $BindingFlags)
+    $connection = $connectionProperty.GetValue($responseStream, $null)
+    $connectionType = $connection.GetType()
+    $networkStreamProperty = $connectionType.GetProperty("NetworkStream", $BindingFlags)
+    $serverStream = $networkStreamProperty.GetValue($connection, $null)
+    return $connection, $serverStream
+}
+
+
+## EXPERIMENTAL.....
+function Invoke-ReverseSocksProxy{
+    param (
+ 
+            [String]$remoteHost = "127.0.0.1",
+ 
+            [Int]$remotePort = 1080,
+
+            [Switch]$useSystemProxy = $false,
+
+            [String]$certFingerprint = "",
+
+            [Int]$threads = 200
+
+     )
+    try{
+        $rsp = [runspacefactory]::CreateRunspacePool(1,$threads);
+        $rsp.CleanupInterval = New-TimeSpan -Seconds 30;
+        $rsp.open();
+        while($true){
+            Write-Host "Connecting to: " $remoteHost ":" $remotePort
+            try{
+                if($useSystemProxy -eq $false){
+                        $client = New-Object System.Net.Sockets.TcpClient($remoteHost, $remotePort)
+                        $cliStream_clear = $client.GetStream()
+                    }else{
+                        $ret = getProxyConnection -remoteHost $remoteHost -remotePort $remotePort
+                        $client = $ret[0]
+                        $cliStream_clear = $ret[1]
+                }
+                if($certFingerprint -eq ''){
+                    $cliStream = New-Object System.Net.Security.SslStream($cliStream_clear,$false,({$true} -as[Net.Security.RemoteCertificateValidationCallback]));
+                }else{
+                    $cliStream = New-Object System.Net.Security.SslStream($cliStream_clear,$false,({return $args[1].GetCertHashString() -eq $certFingerprint } -as[Net.Security.RemoteCertificateValidationCallback]));
+                }
+                $cliStream.AuthenticateAsClient($remoteHost)
+                Write-Host "Connected"
+                $buffer = New-Object System.Byte[] 32
+                $cliStream.ReadTimeout = 30000
+                $cliStream.Read($buffer,0,5) | Out-Null
+                $message = [System.Text.Encoding]::ASCII.GetString($buffer)
+                if($message -ne "HELLO"){
+                    throw "No Client connected";
+                }else{
+                    Write-Host "Connection received"
+                }
+                $cliStream.ReadTimeout = 100000;
+                $vars = [PSCustomObject]@{"cliConnection"=$client; "rsp"=$rsp; "cliStream" = $cliStream}
+                $PS3 = [PowerShell]::Create()
+                $PS3.RunspacePool = $rsp;
+                $PS3.AddScript($SocksConnectionMgr).AddArgument($vars) | Out-Null
+                $PS3.BeginInvoke() | Out-Null
+                Write-Host "Threads Left:" $rsp.GetAvailableRunspaces()
+            }catch{
+                #Write-Host $_.Exception.Message
+                if ($_.Exception.message -eq 'Exception calling "AuthenticateAsClient" with "1" argument(s): "The remote certificate is invalid according to the validation procedure."'){
+                    throw $_
+                }
+                if ($_.Exception.message -eq 'Exception calling "AuthenticateAsClient" with "1" argument(s): "Authentication failed because the remote party has closed the transport stream."'){
+                    sleep 5
+                }
+
+                if (($_.Exception.Message.Length -ge 121) -and $_.Exception.Message.substring(0,120) -eq 'Exception calling ".ctor" with "2" argument(s): "No connection could be made because the target machine actively refused'){
+                    sleep 5
+                }
+                try{
+                    $client.Close()
+                    $client.Dispose()
+                }catch{}
+                    sleep -Milliseconds 200
+                }
+        }
+     }
+    catch{
+        throw $_
+    }
+    finally{
+        write-host "Server closed."
+        if ($client -ne $null) {
+            $client.Dispose()
+            $client = $null
+        }
+        if ($PS3 -ne $null -and $AsyncJobResult3 -ne $null) {
+            $PS3.EndInvoke($AsyncJobResult3) | Out-Null
+            $PS3.Runspace.Close()
+            $PS3.Dispose()
+        }
+    }
+}
+ 
+
+
 function Get-IpAddress{
     param($ip)
     IF ($ip -as [ipaddress]){
@@ -224,3 +371,4 @@ function Get-IpAddress{
     return $ip2
 }
 export-modulemember -function Invoke-SocksProxy
+export-modulemember -function Invoke-ReverseSocksProxy
