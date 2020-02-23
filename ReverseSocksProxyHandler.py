@@ -25,8 +25,12 @@ def handlerServer(q,handlerPort,certificate,privateKey):
                 client_socket = context.wrap_socket(clear_socket, server_side=True)
                 print("Reverse Socks Connection Received: {}:{}".format(address[0],address[1]))
                 try:
+                    data = ""
+                    while (data.count('\n')<3):
+                        data += client_socket.recv()
+                    client_socket.send("HTTP/1.1 200 OK\nContent-Length: 999999\nContent-Type: text/plain\nConnection: Keep-Alive\nKeep-Alive: timeout=20, max=10000\n\n")
                     q.get(False)
-                except:
+                except Exception as e:
                     pass
                 q.put(client_socket)
             except Exception as e:
